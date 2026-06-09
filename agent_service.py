@@ -1,11 +1,14 @@
 import json
 import os
-from groq import Groq
+from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
-load_dotenv()
+from groq import Groq
+from pydantic import BaseModel
 
 import todo_service
 
+load_dotenv()
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
@@ -20,16 +23,16 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title": { "type": "string" },
-                    "task_type": { "type": "string" },
-                    "description": { "type": "string" },
-                    "start_date": { "type": "string" },
-                    "end_date": { "type": "string" },
-                    "status": { "type": "string" }
+                    "title": {"type": "string"},
+                    "task_type": {"type": "string"},
+                    "description": {"type": "string"},
+                    "start_date": {"type": "string"},
+                    "end_date": {"type": "string"},
+                    "status": {"type": "string"},
                 },
-                "required": ["title", "task_type"]
-            }
-        }
+                "required": ["title", "task_type"],
+            },
+        },
     },
     {
         "type": "function",
@@ -39,11 +42,11 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "status": { "type": "string" },
-                    "task_type": { "type": "string" }
-                }
-            }
-        }
+                    "status": {"type": "string"},
+                    "task_type": {"type": "string"},
+                },
+            },
+        },
     },
     {
         "type": "function",
@@ -53,13 +56,13 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "code": { "type": "integer" },
-                    "title": { "type": "string" },
-                    "status": { "type": "string" }
+                    "code": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "status": {"type": "string"},
                 },
-                "required": ["code"]
-            }
-        }
+                "required": ["code"],
+            },
+        },
     },
     {
         "type": "function",
@@ -69,13 +72,102 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "code": { "type": "integer" }
+                    "code": {"type": "integer"},
                 },
-                "required": ["code"]
-            }
-        }
-    }
+                "required": ["code"],
+            },
+        },
+    },
 ]
+
+RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "AgentResponse",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "reply": {"type": "string"},
+            },
+            "required": ["reply"],
+        },
+    },
+}
+
+
+class AgentResponse(BaseModel):
+    reply: str
+
+
+def _parse_agent_response(content: Optional[str]) -> AgentResponse:
+    if not content:
+        raise ValueError("Empty response from model.")
+
+    trimmed = content.strip()
+    if not trimmed:
+        raise ValueError("Empty response from model.")
+
+    try:
+        payload = json.loads(trimmed)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON response: {exc.msg}") from exc
+
+    return AgentResponse.model_validate(payload)
+
+
+def _normalize_tool_call(tool_call: Any) -> Dict[str, Any]:
+    if hasattr(tool_call, "model_dump"):
+        return tool_call.model_dump()
+    if isinstance(tool_call, dict):
+        return tool_call
+
+    return {
+        "id": getattr(tool_call, "id", ""),
+        "function": {
+            "name": getattr(tool_call.function, "name", ""),
+            "arguments": getattr(tool_call.function, "arguments", "{}"),
+        },
+        "type": getattr(tool_call, "type", "function"),
+    }
+
+
+def _run_tool_call(tool_call: Any) -> Any:
+    tool_name = getattr(tool_call.function, "name", None)
+    raw_args = getattr(tool_call.function, "arguments", None)
+
+    if isinstance(raw_args, str):
+        try:
+            args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            args = {}
+    elif isinstance(raw_args, dict):
+        args = raw_args
+    else:
+        args = {}
+
+    if not isinstance(args, dict):
+        args = {}
+
+    if "code" in args:
+        try:
+            args["code"] = int(args["code"])
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        if tool_name == "add_task":
+            return todo_service.add_task(**args)
+        if tool_name == "get_tasks":
+            return todo_service.get_tasks(**args)
+        if tool_name == "update_task":
+            return todo_service.update_task(**args)
+        if tool_name == "delete_task":
+            return todo_service.delete_task(**args)
+    except Exception as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    raise ValueError(f"Unknown tool: {tool_name}")
+
 
 def agent(query: str) -> str:
     messages = [
@@ -91,85 +183,54 @@ def agent(query: str) -> str:
                 "If a request cannot be fulfilled with the available tools, say so clearly.\n"
                 "Do NOT provide generic productivity advice.\n"
                 "Answer in Hebrew.\n"
-            )
+            ),
         },
-        {
-            "role": "user",
-            "content": query
-        }
+        {"role": "user", "content": query},
     ]
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="auto",
-    )
-
-    message = response.choices[0].message
-
-    print("=== RAW MODEL MESSAGE ===")
-    print(message)
-    print("tool_calls:", message.tool_calls)
-    print("=========================")
-
-    # אם המודל בחר להפעיל פונקציה
-    if message.tool_calls:
-        tool_call = message.tool_calls[0]
-        
-        tool_name = tool_call.function.name
-
-        raw_args = tool_call.function.arguments
-
-        # ⬅️ זה הקריטי
-        if raw_args:
-            args = json.loads(raw_args)
-        else:
-            args = {}
-
-        # הגנה מלאה
-        if not isinstance(args, dict):
-            args = {}
-
-        # casting בטוח
-        if "code" in args:
-            args["code"] = int(args["code"])
-
-        try:
-            if tool_name == "add_task":
-                result = todo_service.add_task(**args)
-            elif tool_name == "get_tasks":
-                result = todo_service.get_tasks(**args)
-            elif tool_name == "update_task":
-                result = todo_service.update_task(**args)
-            elif tool_name == "delete_task":
-                result = todo_service.delete_task(**args)
-            else:
-                result = "Unknown action"
-
-        except Exception as e:
-            return f"שגיאה: {str(e)}"
-
-        # ניסוח תשובה אנושית
-        final_response = client.chat.completions.create(
+    while True:
+        response = client.chat.completions.create(
             model=MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Explain the result to the user in a friendly, human way (Hebrew)."
-                },
-                {
-                    "role": "user", "content": query
-                },
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            response_format=RESPONSE_FORMAT,
+            reasoning_format="hidden",
+        )
+
+        completion = response.choices[0]
+        message = completion.message
+        tool_calls = getattr(message, "tool_calls", None) or []
+
+        print("=== RAW MODEL MESSAGE ===")
+        print(message)
+        print("tool_calls:", tool_calls)
+        print("=========================")
+
+        if not tool_calls:
+            try:
+                return _parse_agent_response(message.content).reply
+            except ValueError:
+                return message.content or ""
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": [_normalize_tool_call(call) for call in tool_calls],
+            }
+        )
+
+        for tool_call in tool_calls:
+            try:
+                tool_result = _run_tool_call(tool_call)
+            except Exception as exc:
+                return f"שגיאה: {str(exc)}"
+
+            messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(result, ensure_ascii=False)
+                    "content": json.dumps(tool_result, ensure_ascii=False),
                 }
-            ]
-        )
-
-        return final_response.choices[0].message.content
-
-    # אם לא נבחר tool
-    return message.content
+            )
